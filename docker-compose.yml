@@ -1,0 +1,136 @@
+version: '3.9'
+
+# OpenAIPDF Full Stack Docker Compose
+# Development: docker-compose up
+# Production: docker-compose -f docker-compose.yml -f docker-compose.prod.yml up
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.app
+    container_name: openaipdf_app
+    ports:
+      - '3000:3000'
+    environment:
+      - NODE_ENV=production
+      - APP_NAME=OpenAIPDF
+      - NEXT_PUBLIC_APP_NAME=OpenAIPDF
+      - DATABASE_URL=postgresql://openaipdf:openaipdf_secret@postgres:5432/openaipdf
+      - REDIS_URL=redis://redis:6379
+      - AWS_REGION=${AWS_REGION}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_S3_BUCKET=${AWS_S3_BUCKET:-openaipdf-files}
+      - NEXTAUTH_SECRET=${NEXTAUTH_SECRET}
+      - NEXTAUTH_URL=${NEXTAUTH_URL:-https://openaipdf.com}
+      - NEXT_PUBLIC_SITE_URL=${NEXT_PUBLIC_SITE_URL:-https://openaipdf.com}
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://localhost:3000/api/health']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    container_name: openaipdf_worker
+    environment:
+      - NODE_ENV=production
+      - APP_NAME=OpenAIPDF
+      - REDIS_URL=redis://redis:6379
+      - AWS_REGION=${AWS_REGION}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_S3_BUCKET=${AWS_S3_BUCKET:-openaipdf-files}
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      replicas: 3
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: openaipdf_postgres
+    environment:
+      POSTGRES_DB: openaipdf
+      POSTGRES_USER: openaipdf
+      POSTGRES_PASSWORD: openaipdf_secret
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - '5432:5432'
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U openaipdf -d openaipdf']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: openaipdf_redis
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - '6379:6379'
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  nginx:
+    image: nginx:alpine
+    container_name: openaipdf_nginx
+    ports:
+      - '80:80'
+      - '443:443'
+    volumes:
+      - ./docker/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./docker/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - app
+    restart: unless-stopped
+
+  bull-board:
+    image: deadly0/bull-board
+    container_name: openaipdf_bull_board
+    ports:
+      - '3001:3000'
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    depends_on:
+      - redis
+    profiles:
+      - debug
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  default:
+    name: openaipdf_network

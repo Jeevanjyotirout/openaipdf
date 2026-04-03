@@ -1,0 +1,213 @@
+name: PDFPro CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  NODE_VERSION: '20'
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ── Lint & Test ─────────────────────────────────────────────────────────────
+  test:
+    name: Test & Lint
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: pdfpro_test
+          POSTGRES_USER: pdfpro
+          POSTGRES_PASSWORD: test_secret
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+        env:
+          DATABASE_URL: postgresql://pdfpro:test_secret@localhost:5432/pdfpro_test
+
+      - name: Run database migrations
+        run: npx prisma migrate deploy
+        env:
+          DATABASE_URL: postgresql://pdfpro:test_secret@localhost:5432/pdfpro_test
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+      - name: Unit tests
+        run: npm test -- --coverage --passWithNoTests
+        env:
+          DATABASE_URL: postgresql://pdfpro:test_secret@localhost:5432/pdfpro_test
+          REDIS_URL: redis://localhost:6379
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        if: always()
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  # ── E2E Tests ───────────────────────────────────────────────────────────────
+  e2e:
+    name: E2E Tests
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+
+      - name: Build app
+        run: npm run build
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL_TEST }}
+          NEXTAUTH_SECRET: test-secret
+          NEXTAUTH_URL: http://localhost:3000
+
+      - name: Run Playwright tests
+        run: npx playwright test
+        env:
+          BASE_URL: http://localhost:3000
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 30
+
+  # ── Build Docker Images ─────────────────────────────────────────────────────
+  build:
+    name: Build & Push Docker Images
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build & push app image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.app
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/app:latest,${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/app:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build & push worker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.worker
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/worker:latest,${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/worker:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ── Deploy to Production ─────────────────────────────────────────────────────
+  deploy:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [build, e2e]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to Vercel (frontend)
+        uses: amondnet/vercel-action@v25
+        with:
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+          vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID }}
+          vercel-args: '--prod'
+
+      - name: Deploy workers to EC2
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.WORKER_HOST }}
+          username: ${{ secrets.WORKER_USER }}
+          key: ${{ secrets.WORKER_SSH_KEY }}
+          script: |
+            cd /opt/pdfpro
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/worker:latest
+            docker-compose -f docker-compose.prod.yml up -d --no-deps worker
+            docker system prune -f --volumes
+
+      - name: Run database migrations
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.WORKER_HOST }}
+          username: ${{ secrets.WORKER_USER }}
+          key: ${{ secrets.WORKER_SSH_KEY }}
+          script: |
+            docker exec pdfpro_app npx prisma migrate deploy
+
+      - name: Notify Slack
+        uses: rtCamp/action-slack-notify@v2
+        if: always()
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_TITLE: 'PDFPro Deployment'
+          SLACK_MESSAGE: 'Deployed commit ${{ github.sha }} to production'
+          SLACK_COLOR: ${{ job.status == 'success' && 'good' || 'danger' }}

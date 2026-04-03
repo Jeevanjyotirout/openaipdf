@@ -1,0 +1,46 @@
+# docker/Dockerfile.worker
+# PDF Processing Worker Container
+
+FROM node:20-alpine AS base
+
+# Install system PDF processing tools
+RUN apk add --no-cache \
+    ghostscript \
+    imagemagick \
+    tesseract-ocr \
+    tesseract-ocr-data-eng \
+    tesseract-ocr-data-deu \
+    tesseract-ocr-data-fra \
+    tesseract-ocr-data-spa \
+    tesseract-ocr-data-por \
+    tesseract-ocr-data-chi_sim \
+    tesseract-ocr-data-jpn \
+    libreoffice \
+    poppler-utils \
+    qpdf \
+    curl \
+    ca-certificates
+
+WORKDIR /app
+
+COPY package.json package-lock.json* ./
+RUN npm ci --only=production && npm cache clean --force
+
+COPY workers/ ./workers/
+COPY services/ ./services/
+COPY lib/ ./lib/
+
+# Create temp directory for file processing
+RUN mkdir -p /tmp/pdfpro && chmod 777 /tmp/pdfpro
+
+# Security: run as non-root
+RUN addgroup --system --gid 1002 worker && \
+    adduser --system --uid 1002 workeruser && \
+    chown -R workeruser:worker /app /tmp/pdfpro
+
+USER workeruser
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD node -e "require('ioredis'); console.log('healthy')" || exit 1
+
+CMD ["node", "workers/index.js"]
